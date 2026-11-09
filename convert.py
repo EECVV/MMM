@@ -1,4 +1,4 @@
-"""Fetch a TXT channel list and atomically publish an extended M3U playlist."""
+"""Merge one or more online TXT channel lists into an extended M3U playlist."""
 import os
 from pathlib import Path
 import sys
@@ -142,16 +142,66 @@ def fetch(url):
         ) from None
 
 
-def main():
-    source = os.environ.get("TXT_URL", "").strip()
-    if not source:
+def parse_source_urls(value):
+    urls = []
+    seen = set()
+    for line in value.splitlines():
+        url = line.strip()
+        if not url or url.startswith("#"):
+            continue
+        try:
+            parsed = urlsplit(url)
+            valid = parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+            valid = valid and not any(character.isspace() for character in url)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("TXT_URL must contain one complete HTTP/HTTPS URL per line")
+        if url not in seen:
+            urls.append(url)
+            seen.add(url)
+    if not urls:
         raise ValueError("Set repository Actions secret TXT_URL first")
-    output, count, skipped = convert(fetch(source))
+    return urls
+
+
+def merge_sources(urls):
+    result = ["#EXTM3U"]
+    seen = set()
+    skipped = duplicates = 0
+    for index, url in enumerate(urls, start=1):
+        print(f"Loading source {index}/{len(urls)}")
+        try:
+            playlist, count, source_skipped = convert(fetch(url))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Source {index}/{len(urls)} failed: {exc}. "
+                "No partial playlist was published; previous output is preserved"
+            ) from None
+        skipped += source_skipped
+        lines = playlist.splitlines()[1:]
+        for offset in range(0, len(lines), 2):
+            entry = (lines[offset], lines[offset + 1])
+            if entry in seen:
+                duplicates += 1
+                continue
+            seen.add(entry)
+            result.extend(entry)
+        print(f"Source {index}/{len(urls)}: parsed {count} channels")
+    return "\n".join(result) + "\n", len(seen), skipped, duplicates
+
+
+def main():
+    urls = parse_source_urls(os.environ.get("TXT_URL", ""))
+    output, count, skipped, duplicates = merge_sources(urls)
     destination = Path("live.m3u")
     temporary = destination.with_suffix(".m3u.tmp")
     temporary.write_text(output, encoding="utf-8")
     temporary.replace(destination)
-    print(f"Generated {count} channels; skipped {skipped} unrecognized lines")
+    print(
+        f"Generated {count} channels from {len(urls)} sources; "
+        f"skipped {skipped} unrecognized lines; removed {duplicates} exact duplicates"
+    )
 
 
 if __name__ == "__main__":
